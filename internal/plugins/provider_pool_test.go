@@ -17,6 +17,7 @@ import (
 
 	"github.com/opentofu/opentofu/internal/addrs"
 	"github.com/opentofu/opentofu/internal/providers"
+	"github.com/opentofu/opentofu/internal/tfdiags"
 	"github.com/zclconf/go-cty/cty"
 )
 
@@ -364,5 +365,30 @@ func TestProviderPool_lazyStartConfigureErrorOnFirstUse(t *testing.T) {
 	}
 	if msg := resp.Diagnostics.Err().Error(); !strings.Contains(msg, ProviderLazyStartEnvVar) || !strings.Contains(msg, "sts throttled") {
 		t.Fatalf("unexpected error: %s", msg)
+	}
+}
+
+func TestProviderPool_lazyStartErrorUsesInstanceContextOnce(t *testing.T) {
+	tr := newPoolTracker()
+	tr.failStart = func(id string, _ int) bool { return id == "bad" }
+	t.Setenv(ProviderLazyStartEnvVar, "true")
+	m := tr.manager(t, "1")
+	contextualized := 0
+	ctx := WithProviderInstance(t.Context(), `provider["pooltest"].x["bad"]`, func(d tfdiags.Diagnostics) tfdiags.Diagnostics {
+		contextualized++
+		return d
+	})
+	bad, _ := m.NewConfiguredProvider(ctx, poolTestAddr, poolCfg("bad"))
+
+	first := bad.ReadResource(t.Context(), providers.ReadResourceRequest{})
+	if !first.Diagnostics.HasErrors() || !strings.Contains(first.Diagnostics.Err().Error(), "sts throttled") || contextualized != 1 {
+		t.Fatalf("first use: contextualized=%d err=%v", contextualized, first.Diagnostics.Err())
+	}
+	second := bad.ReadResource(t.Context(), providers.ReadResourceRequest{})
+	if !second.Diagnostics.HasErrors() || !strings.Contains(second.Diagnostics.Err().Error(), `x["bad"] failed to configure when first used`) {
+		t.Fatalf("second use: %v", second.Diagnostics.Err())
+	}
+	if got := tr.startsOf("bad"); got != 1 {
+		t.Fatalf("failed lazy start retried: %d configure attempts", got)
 	}
 }

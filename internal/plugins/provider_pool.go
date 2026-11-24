@@ -110,6 +110,22 @@ func (pp *providerPool) notifyLocked() {
 
 type startFunc func(ctx context.Context) (providers.Interface, tfdiags.Diagnostics)
 
+type providerInstanceContextKey struct{}
+
+type providerInstanceContext struct {
+	name          string
+	contextualize func(tfdiags.Diagnostics) tfdiags.Diagnostics
+}
+
+// WithProviderInstance annotates the context passed to NewConfiguredProvider
+// with the provider instance address and a function that attaches the
+// provider's configuration context to diagnostics. Pooled instances use these
+// so that errors from a deferred (lazy) start are reported the same way as
+// errors from configuring the provider directly.
+func WithProviderInstance(ctx context.Context, name string, contextualize func(tfdiags.Diagnostics) tfdiags.Diagnostics) context.Context {
+	return context.WithValue(ctx, providerInstanceContextKey{}, providerInstanceContext{name: name, contextualize: contextualize})
+}
+
 // pooledProvider is a providers.Configured whose underlying plugin process may be
 // stopped and restarted transparently by its providerPool.
 type pooledProvider struct {
@@ -117,6 +133,9 @@ type pooledProvider struct {
 	manager *providerManager
 	addr    addrs.Provider
 	start   startFunc
+	// name is the provider instance address, for messages.
+	name          string
+	contextualize func(tfdiags.Diagnostics) tfdiags.Diagnostics
 
 	// The fields below are guarded by pool.mu.
 	inst     providers.Interface
@@ -126,7 +145,9 @@ type pooledProvider struct {
 	closed   bool
 	stopped  bool
 	everLive bool
-	idleElem *list.Element
+	// startFailed records a failed lazy first start, which is not retried.
+	startFailed bool
+	idleElem    *list.Element
 }
 
 var _ providers.Configured = (*pooledProvider)(nil)
@@ -142,7 +163,15 @@ func (p *pooledProvider) acquire(ctx context.Context) (providers.Interface, tfdi
 	for {
 		if p.closed {
 			pp.mu.Unlock()
-			return nil, diags.Append(fmt.Errorf("bug: provider %s used after it was closed", p.addr))
+			return nil, diags.Append(fmt.Errorf("bug: provider %s used after it was closed", p.name))
+		}
+		if p.startFailed {
+			pp.mu.Unlock()
+			return nil, diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Provider instance unavailable",
+				fmt.Sprintf("%s failed to configure when first used; see the earlier error for details.", p.name),
+			))
 		}
 		if p.inst != nil && !p.starting {
 			if p.inflight == 0 {
@@ -212,6 +241,9 @@ func (p *pooledProvider) acquire(ctx context.Context) (providers.Interface, tfdi
 	if startDiags.HasErrors() || p.closed || p.stopped || pp.stopped {
 		pp.live--
 		pp.busy--
+		if startDiags.HasErrors() && !isRestart && pp.lazy {
+			p.startFailed = true
+		}
 		pp.notifyLocked()
 		pp.mu.Unlock()
 		if inst != nil {
@@ -221,14 +253,18 @@ func (p *pooledProvider) acquire(ctx context.Context) (providers.Interface, tfdi
 			return nil, diags.Append(tfdiags.Sourceless(
 				tfdiags.Error,
 				"Failed to restart provider",
-				fmt.Sprintf("The provider %s was stopped to stay within %s=%d and failed to restart:\n\n%s", p.addr, ProviderInstanceLimitEnvVar, pp.limit, startDiags.ErrWithWarnings()),
+				fmt.Sprintf("The provider %s was stopped to stay within %s=%d and failed to restart:\n\n%s", p.name, ProviderInstanceLimitEnvVar, pp.limit, startDiags.ErrWithWarnings()),
 			))
 		}
 		if startDiags.HasErrors() && pp.lazy {
+			log.Printf("[ERROR] plugins.providerPool: %s failed to configure when first used (%s is set)", p.name, ProviderLazyStartEnvVar)
+			if p.contextualize != nil {
+				return nil, p.contextualize(startDiags)
+			}
 			return nil, diags.Append(tfdiags.Sourceless(
 				tfdiags.Error,
 				"Failed to configure provider",
-				fmt.Sprintf("The provider %s failed to configure when first used (%s is set, so provider configuration is deferred until first use):\n\n%s", p.addr, ProviderLazyStartEnvVar, startDiags.ErrWithWarnings()),
+				fmt.Sprintf("%s failed to configure when first used (%s is set, so provider configuration is deferred until first use):\n\n%s", p.name, ProviderLazyStartEnvVar, startDiags.ErrWithWarnings()),
 			))
 		}
 		if startDiags.HasErrors() {
@@ -514,9 +550,15 @@ func (p *providerManager) newPooledConfiguredProvider(ctx context.Context, addr 
 		pool:    p.pool,
 		manager: p,
 		addr:    addr,
+		name:    addr.String(),
 		start: func(ctx context.Context) (providers.Interface, tfdiags.Diagnostics) {
 			return p.startConfiguredProvider(ctx, addr, unmarkedConfigVal)
 		},
+	}
+
+	if ic, ok := ctx.Value(providerInstanceContextKey{}).(providerInstanceContext); ok {
+		proxy.name = ic.name
+		proxy.contextualize = ic.contextualize
 	}
 
 	p.instancesLock.Lock()

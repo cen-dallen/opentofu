@@ -16,6 +16,7 @@ import (
 	"github.com/opentofu/opentofu/internal/addrs"
 	"github.com/opentofu/opentofu/internal/configs/configschema"
 	"github.com/opentofu/opentofu/internal/instances"
+	"github.com/opentofu/opentofu/internal/plugins"
 	"github.com/opentofu/opentofu/internal/providers"
 	"github.com/opentofu/opentofu/internal/tfdiags"
 	"github.com/opentofu/opentofu/internal/tracing"
@@ -241,8 +242,11 @@ func (n *NodeApplyableProvider) ConfigureProvider(ctx context.Context, evalCtx E
 		return diags
 	}
 
-	provider, newDiags := evalCtx.Providers().NewConfiguredProvider(ctx, n.Addr.Provider, configVal)
-	diags = diags.Append(newDiags.InConfigBody(configBody, n.Addr.InstanceString(providerKey)))
+	instanceAddr := n.Addr.InstanceString(providerKey)
+	contextualize := func(d tfdiags.Diagnostics) tfdiags.Diagnostics { return d.InConfigBody(configBody, instanceAddr) }
+	providerCtx := plugins.WithProviderInstance(ctx, instanceAddr, contextualize)
+	provider, newDiags := evalCtx.Providers().NewConfiguredProvider(providerCtx, n.Addr.Provider, configVal)
+	diags = diags.Append(contextualize(newDiags))
 
 	n.instances[providerKey] = provider
 
