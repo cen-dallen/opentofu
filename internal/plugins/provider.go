@@ -68,13 +68,20 @@ type providerManager struct {
 	instancesLock sync.Mutex
 	instances     []providers.Configured
 
+	// pool is non-nil when TOFU_PROVIDER_INSTANCE_LIMIT is set.
+	pool *providerPool
+
 	isShutdown atomic.Bool
 }
 
 func (l *library) NewProviderManager() ProviderManager {
-	return &providerManager{
+	m := &providerManager{
 		library: l,
 	}
+	if limit := providerInstanceLimitFromEnv(); limit > 0 {
+		m.pool = newProviderPool(limit)
+	}
+	return m
 }
 
 func (p *providerManager) HasProvider(addr addrs.Provider) bool {
@@ -151,6 +158,14 @@ func (p *providerManager) NewProvider(ctx context.Context, addr addrs.Provider) 
 }
 
 func (p *providerManager) NewConfiguredProvider(ctx context.Context, addr addrs.Provider, configVal cty.Value) (providers.Configured, tfdiags.Diagnostics) {
+	// If our config value contains any marked values, ensure those are
+	// stripped out before sending this to the provider
+	unmarkedConfigVal, _ := configVal.UnmarkDeep()
+
+	if p.pool != nil {
+		return p.newPooledConfiguredProvider(ctx, addr, unmarkedConfigVal)
+	}
+
 	var diags tfdiags.Diagnostics
 
 	p.instancesLock.Lock()
@@ -166,10 +181,35 @@ func (p *providerManager) NewConfiguredProvider(ctx context.Context, addr addrs.
 
 	p.instances = append(p.instances, provider)
 
-	// If our config value contains any marked values, ensure those are
-	// stripped out before sending this to the provider
-	unmarkedConfigVal, _ := configVal.UnmarkDeep()
+	validated, diags := configureProvider(ctx, addr, provider, unmarkedConfigVal)
+	if !validated {
+		return nil, diags
+	}
+	return provider, diags
+}
 
+// startConfiguredProvider starts and configures an untracked provider process
+// for the pool. On error the process is closed and nil is returned.
+func (p *providerManager) startConfiguredProvider(ctx context.Context, addr addrs.Provider, unmarkedConfigVal cty.Value) (providers.Interface, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+	if p.isShutdown.Load() {
+		return nil, diags.Append(fmt.Errorf("bug: unable to start provider %s, manager is shutdown", addr))
+	}
+	provider, err := p.providerFactories.NewInstance(addr)
+	if err != nil {
+		return nil, diags.Append(err)
+	}
+	_, diags = configureProvider(ctx, addr, provider, unmarkedConfigVal)
+	if diags.HasErrors() {
+		_ = provider.Close(context.WithoutCancel(ctx))
+		return nil, diags
+	}
+	return provider, diags
+}
+
+// configureProvider validates and configures provider. validated is false if
+// ValidateProviderConfig returned errors and ConfigureProvider was not called.
+func configureProvider(ctx context.Context, addr addrs.Provider, provider providers.Interface, unmarkedConfigVal cty.Value) (validated bool, diags tfdiags.Diagnostics) {
 	// Allow the provider to validate and insert any defaults into the full
 	// configuration.
 	req := providers.ValidateProviderConfigRequest{
@@ -181,7 +221,7 @@ func (p *providerManager) NewConfiguredProvider(ctx context.Context, addr addrs.
 	validateResp := provider.ValidateProviderConfig(ctx, req)
 	diags = diags.Append(validateResp.Diagnostics)
 	if diags.HasErrors() {
-		return nil, diags
+		return false, diags
 	}
 
 	// If the provider returns something different, log a warning to help
@@ -201,10 +241,14 @@ func (p *providerManager) NewConfiguredProvider(ctx context.Context, addr addrs.
 	})
 	diags = diags.Append(configResp.Diagnostics)
 
-	return provider, diags
+	return true, diags
 }
 
 func (p *providerManager) StopAll(ctx context.Context) error {
+	if p.pool != nil {
+		p.pool.stopAll()
+	}
+
 	p.instancesLock.Lock()
 	defer p.instancesLock.Unlock()
 
@@ -218,6 +262,10 @@ func (p *providerManager) StopAll(ctx context.Context) error {
 }
 
 func (p *providerManager) CloseAll(ctx context.Context) error {
+	if p.pool != nil {
+		p.pool.logStats()
+	}
+
 	p.instancesLock.Lock()
 	defer p.instancesLock.Unlock()
 
