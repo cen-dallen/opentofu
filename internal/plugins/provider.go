@@ -68,7 +68,8 @@ type providerManager struct {
 	instancesLock sync.Mutex
 	instances     []providers.Configured
 
-	// pool is non-nil when TOFU_PROVIDER_INSTANCE_LIMIT is set.
+	// pool is non-nil when TOFU_PROVIDER_INSTANCE_LIMIT is set; see also
+	// TOFU_PROVIDER_LAZY_START.
 	pool *providerPool
 
 	isShutdown atomic.Bool
@@ -79,7 +80,7 @@ func (l *library) NewProviderManager() ProviderManager {
 		library: l,
 	}
 	if limit := providerInstanceLimitFromEnv(); limit > 0 {
-		m.pool = newProviderPool(limit)
+		m.pool = newProviderPool(limit, providerLazyStartFromEnv())
 	}
 	return m
 }

@@ -160,6 +160,7 @@ func readID(t *testing.T, p providers.Configured) string {
 }
 
 func TestProviderPool_disabledByDefault(t *testing.T) {
+	t.Setenv(ProviderLazyStartEnvVar, "true") // has no effect without a limit
 	for _, v := range []string{"", "0", "bogus", "-3"} {
 		tr := newPoolTracker()
 		m := tr.manager(t, v)
@@ -328,5 +329,40 @@ func TestProviderPool_waitHonoursContext(t *testing.T) {
 	close(tr.block)
 	if !resp.Diagnostics.HasErrors() || !strings.Contains(resp.Diagnostics.Err().Error(), "deadline") {
 		t.Fatalf("expected context deadline error, got %v", resp.Diagnostics.Err())
+	}
+}
+
+func TestProviderPool_lazyStart(t *testing.T) {
+	tr := newPoolTracker()
+	t.Setenv(ProviderLazyStartEnvVar, "true")
+	m := tr.manager(t, "2")
+	a := newPooled(t, m, "a")
+	newPooled(t, m, "unused")
+	if live, _ := tr.snapshot(); live != 0 {
+		t.Fatalf("live=%d after configuring lazily, want 0", live)
+	}
+	if got := readID(t, a); got != "a" {
+		t.Fatalf("a served by %q", got)
+	}
+	if tr.startsOf("a") != 1 || tr.startsOf("unused") != 0 {
+		t.Fatalf("starts a=%d unused=%d, want 1/0", tr.startsOf("a"), tr.startsOf("unused"))
+	}
+}
+
+func TestProviderPool_lazyStartConfigureErrorOnFirstUse(t *testing.T) {
+	tr := newPoolTracker()
+	tr.failStart = func(id string, _ int) bool { return id == "bad" }
+	t.Setenv(ProviderLazyStartEnvVar, "1")
+	m := tr.manager(t, "1")
+	bad, diags := m.NewConfiguredProvider(t.Context(), poolTestAddr, poolCfg("bad"))
+	if diags.HasErrors() {
+		t.Fatalf("lazy configure reported errors before first use: %s", diags.Err())
+	}
+	resp := bad.ReadResource(t.Context(), providers.ReadResourceRequest{})
+	if !resp.Diagnostics.HasErrors() {
+		t.Fatal("expected configure error on first use")
+	}
+	if msg := resp.Diagnostics.Err().Error(); !strings.Contains(msg, ProviderLazyStartEnvVar) || !strings.Contains(msg, "sts throttled") {
+		t.Fatalf("unexpected error: %s", msg)
 	}
 }

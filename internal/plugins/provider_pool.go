@@ -38,6 +38,27 @@ func providerInstanceLimitFromEnv() int {
 	return limit
 }
 
+// ProviderLazyStartEnvVar, when true and the pool is enabled, defers starting
+// and configuring each provider instance until its first RPC instead of doing
+// it where the provider is configured. Starts then run concurrently with the
+// graph walk rather than serially in the provider node, and instances that are
+// never used are never started. Configuration and credential errors are
+// reported on the first resource that uses the instance.
+const ProviderLazyStartEnvVar = "TOFU_PROVIDER_LAZY_START"
+
+func providerLazyStartFromEnv() bool {
+	raw := os.Getenv(ProviderLazyStartEnvVar)
+	if raw == "" {
+		return false
+	}
+	lazy, err := strconv.ParseBool(raw)
+	if err != nil {
+		log.Printf("[WARN] ignoring invalid %s=%q: must be a boolean", ProviderLazyStartEnvVar, raw)
+		return false
+	}
+	return lazy
+}
+
 // providerPool bounds the number of live configured provider processes.
 //
 // Each configured provider instance is represented by a pooledProvider proxy
@@ -55,6 +76,7 @@ func providerInstanceLimitFromEnv() int {
 //     exceeds the limit rather than deadlock.
 type providerPool struct {
 	limit int
+	lazy  bool
 
 	mu sync.Mutex
 	// changed is closed and replaced whenever a slot may have become available.
@@ -71,9 +93,10 @@ type providerPool struct {
 	restarts int
 }
 
-func newProviderPool(limit int) *providerPool {
+func newProviderPool(limit int, lazy bool) *providerPool {
 	return &providerPool{
 		limit:   limit,
+		lazy:    lazy,
 		changed: make(chan struct{}),
 		idle:    list.New(),
 	}
@@ -201,6 +224,13 @@ func (p *pooledProvider) acquire(ctx context.Context) (providers.Interface, tfdi
 				fmt.Sprintf("The provider %s was stopped to stay within %s=%d and failed to restart:\n\n%s", p.addr, ProviderInstanceLimitEnvVar, pp.limit, startDiags.ErrWithWarnings()),
 			))
 		}
+		if startDiags.HasErrors() && pp.lazy {
+			return nil, diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Failed to configure provider",
+				fmt.Sprintf("The provider %s failed to configure when first used (%s is set, so provider configuration is deferred until first use):\n\n%s", p.addr, ProviderLazyStartEnvVar, startDiags.ErrWithWarnings()),
+			))
+		}
 		if startDiags.HasErrors() {
 			return nil, startDiags
 		}
@@ -293,7 +323,7 @@ func (pp *providerPool) logStats() {
 
 func (pp *providerPool) logStatsLocked() {
 	if pp.starts > 0 {
-		log.Printf("[INFO] plugins.providerPool: limit=%d starts=%d restarts=%d", pp.limit, pp.starts, pp.restarts)
+		log.Printf("[INFO] plugins.providerPool: limit=%d lazy=%t starts=%d restarts=%d", pp.limit, pp.lazy, pp.starts, pp.restarts)
 	}
 }
 
@@ -476,8 +506,9 @@ func (p *pooledProvider) GetFunctions(ctx context.Context) providers.GetFunction
 	return inst.GetFunctions(ctx)
 }
 
-// newPooledConfiguredProvider creates a pooled instance and starts it once
-// eagerly so that configuration errors surface where the provider is configured.
+// newPooledConfiguredProvider creates a pooled instance. Unless the pool is
+// lazy, it starts the instance once eagerly so that configuration errors
+// surface where the provider is configured.
 func (p *providerManager) newPooledConfiguredProvider(ctx context.Context, addr addrs.Provider, unmarkedConfigVal cty.Value) (providers.Configured, tfdiags.Diagnostics) {
 	proxy := &pooledProvider{
 		pool:    p.pool,
@@ -495,6 +526,10 @@ func (p *providerManager) newPooledConfiguredProvider(ctx context.Context, addr 
 	}
 	p.instances = append(p.instances, proxy)
 	p.instancesLock.Unlock()
+
+	if p.pool.lazy {
+		return proxy, nil
+	}
 
 	_, diags := proxy.acquire(ctx)
 	if !diags.HasErrors() {
